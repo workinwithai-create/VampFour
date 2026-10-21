@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>VampFour — four-bar vamp desk</title>
+  <meta name="description" content="Four live-instrument bars of vamp so the song can breathe. Then the next section lands." />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main>
+  <p class="eyebrow">WorkinWithAI · live chairs</p>
+  <h1>VampFour</h1>
+  <p class="lead">Four-bar vamp desk. Generators loop the chorus or mute to silence. Session players write four live bars of pedal, figure, and half kit so the track can breathe or hand off. Live piano, upright, nylon, kit, trumpet, violin.</p>
+  <p class="status" id="status">Seating chairs…</p>
+  <div class="controls">
+    <label>BPM <input type="number" id="bpm" min="60" max="180" value="96" /></label>
+    <label>Key <select id="key"><option>A minor</option><option>C major</option><option>E minor</option><option>G major</option><option>D minor</option></select></label>
+  </div>
+  <p class="eyebrow">Groove</p>
+  <div class="row" id="grooves"></div>
+  <p class="eyebrow">Vamp</p>
+  <div class="row" id="recipes"></div>
+  <p class="eyebrow">Form · chorus 1–8 · vamp 9–12</p>
+  <div class="bars" id="bars"></div>
+  <h2>Punch list</h2>
+  <pre id="punch"></pre>
+  <div class="exports">
+    <button id="exportWav">Export WAV (bars 9–12)</button>
+    <button id="exportMid">Export MIDI</button>
+  </div>
+</main>
+<div class="dock">
+  <button id="playA">A · Loop</button>
+  <button id="playB">B · Vamp</button>
+  <button id="play8">8 · Vamp only</button>
+  <button class="ghost" id="stop">Stop</button>
+  <button class="ghost" id="copy">Copy punch</button>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
