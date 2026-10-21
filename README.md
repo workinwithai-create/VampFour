@@ -35,6 +35,19 @@ VampFour is the middle-section breath — not an ending, not a climb, not a dens
 - B · Full form (chorus + vamp, then stop)
 - 8 · Vamp only (for the export you drop on bars 9–12)
 
+## Exports (production-ready)
+
+WAV and MIDI drop on the DAW grid:
+- OfflineAudioContext render
+- First downbeat at sample 0
+- Exact length `Math.round(bars * 4 * 60 / bpm * 48000)`
+- Ring-out tail folded for seamless loop
+- Peak ≤ -1 dBFS
+- Key transposition applied
+- Matching MIDI with tempo and 4/4
+
+File names: `vampfour-<recipe>-<bpm>bpm-<key>.wav` / `.mid`
+
 ## Pricing recommendation
 
 **One-time $29** on Lemon Squeezy (merchant of record).  
