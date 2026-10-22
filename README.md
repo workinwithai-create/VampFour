@@ -73,3 +73,11 @@ Follows the WorkinWithAI audio rules: AudioContext-clock lookahead scheduler, on
 ## Stack
 
 Static HTML + one JS file. No build, no auth, no database.
+
+## Play along live
+
+Pick any VampFour voice (piano, upright bass, nylon, trumpet, violin, acoustic kit — the same pinned samples) and play it:
+- **MIDI keyboard**: press *Connect MIDI* (Web MIDI permission), choose the input. Velocity and sustain pedal (CC64) work; notes sound immediately and never start the band. Optional: let MIDI Start/Stop run the band. MIDI out echoes what you play.
+- **On-screen keys** (touch/mouse) and **computer keys** A W S E D F T G Y H U J K, Z/X octave, hold Space for sustain.
+- **Audio output** picker (AudioContext.setSinkId, with an `<audio>` element fallback).
+- **Takes**: tick *Record*, press play; each loop pass becomes a new take. Set each to Loop or Silent, mute or delete. Up to 16, saved on this device. Each take is its own MIDI track; Loop + unmuted takes are mixed into the WAV.
