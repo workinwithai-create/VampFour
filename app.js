@@ -201,7 +201,7 @@ function eventsFor(b, s, st = state) {
 // ---------- Audio ----------
 let ctx = null, master = null, sectionGain = null, chairGain = {}, decoded = {}, raw = {}, missing = [], active = [];
 let nextStepTime = 0, step = 0, timerId = null, rafId = null, scheduled = [];
-let vampMakeup = 1, liveBus = null, outComp = null, passNo = 0, session = 0;
+let vampMakeup = 1, liveBus = null, outComp = null, bandBus = null, userMaster = null, outLim = null, passNo = 0, session = 0;
 const stepLog = [];
 window.__schedLog = [];
 
@@ -224,8 +224,15 @@ function makeBus(ac) {
   const chairs = {};
   for (const c of CHAIRS) { chairs[c] = ac.createGain(); chairs[c].connect(sec); }
   const live = ac.createGain(); live.connect(m); // live playing + takes: outside the section makeup gain
-  sec.connect(m); m.connect(comp); comp.connect(ac.destination);
-  return { master: m, sec, chairs, live, comp };
+  if (ac instanceof OfflineAudioContext) { // exports + loudness renders: unchanged chain
+    sec.connect(m); m.connect(comp); comp.connect(ac.destination);
+    return { master: m, sec, chairs, live, comp };
+  }
+  // Live playback only: user Band / Master faders and a brickwall-style limiter after the bus compressor.
+  const band = ac.createGain(), user = ac.createGain(), lim = ac.createDynamicsCompressor();
+  lim.threshold.value = -2; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.001; lim.release.value = 0.12;
+  sec.connect(band); band.connect(m); m.connect(user); user.connect(comp); comp.connect(lim); lim.connect(ac.destination);
+  return { master: m, sec, chairs, live, comp, band, user, lim };
 }
 
 // Zero-crossing loop points in the sustained middle of a sample.
@@ -302,8 +309,8 @@ let samplesOk = null, decodePromise = null;
 async function startAudio() {
   if (!ctx) {
     ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-    const bus = makeBus(ctx); master = bus.master; sectionGain = bus.sec; chairGain = bus.chairs; liveBus = bus.live; outComp = bus.comp;
-    liveBus.gain.value = live.level; applySink();
+    const bus = makeBus(ctx); master = bus.master; sectionGain = bus.sec; chairGain = bus.chairs; liveBus = bus.live; outComp = bus.comp; bandBus = bus.band; userMaster = bus.user; outLim = bus.lim;
+    applyLevels(); applySink();
     applyMutes();
   }
   if (ctx.state !== "running") await ctx.resume();
@@ -426,7 +433,7 @@ async function renderSection(st, bars, startBar, { fold: doFold = true, normaliz
     for (const e of eventsFor(b, i % STEPS_PER_BAR, st)) if (!st.mutes[e.chair]) voice(off, bufs, bus.chairs[e.chair], e, t, bpm);
     for (const tk of tks) for (const e of takeStepEvents(tk, i)) voice(off, bufs, bus.live, e.ev, t + e.frac * stepDur, bpm);
   }
-  bus.live.gain.value = live.level;
+  bus.live.gain.value = liveGainLin();
   const r = await off.startRendering();
   const L = new Float32Array(exact), R = new Float32Array(exact);
   const l = r.getChannelData(0).subarray(lat), rr = r.getChannelData(1).subarray(lat);
@@ -627,9 +634,21 @@ function buildUI() {
 // ---------- Play along live: MIDI keyboard / computer keys / on-screen keys -> VampFour's own pinned samples ----------
 // Notes trigger immediately at ctx.currentTime, beside the lookahead scheduler. Notes never start the transport.
 const LIVE_LS = "vampfour.live.v1";
-const live = Object.assign({ inst: "piano", oct: 4, level: 0.9, rec: false, midiIn: "", midiOut: "", midiTransport: false, sink: "" },
+const live = Object.assign({ inst: "piano", oct: 4, liveDb: 0, bandDb: 0, masterDb: 0, rec: false, midiIn: "", midiOut: "", midiTransport: false, sink: "" },
   (() => { try { return JSON.parse(localStorage.getItem(LIVE_LS) || "{}"); } catch { return {}; } })());
 if (!INSTRUMENTS[live.inst]) live.inst = "piano";
+delete live.level; // pre-volume-fader setting (linear 0..1.5); replaced by dB faders
+for (const [k, lo, hi] of [["liveDb", -40, 12], ["bandDb", -40, 6], ["masterDb", -40, 6]]) live[k] = Number.isFinite(+live[k]) ? Math.max(lo, Math.min(hi, +live[k])) : 0;
+// Live samples sit far below the dense band mix (measured ~20 dB RMS below). LIVE_MAKEUP lines a normal
+// strong performance up with the band at 0 dB on the "Your playing" fader; the limiter catches the rest.
+const LIVE_MAKEUP = 5.6, KEY_VEL = 100 / 127;
+const dbLin = db => db <= -40 ? 0 : Math.pow(10, db / 20);
+const liveGainLin = () => LIVE_MAKEUP * dbLin(live.liveDb);
+function applyLevels() {
+  if (liveBus) liveBus.gain.value = liveGainLin();
+  if (bandBus) bandBus.gain.value = dbLin(live.bandDb);
+  if (userMaster) userMaster.gain.value = dbLin(live.masterDb);
+}
 const saveLive = () => localStorage.setItem(LIVE_LS, JSON.stringify(live));
 const liveVoices = new Map(), liveOpen = new Map();
 let sustain = false, midiAccess = null, midiInPort = null, midiOut = null;
@@ -640,7 +659,7 @@ function takeNote(inst, n) {
   if (inst === "kit") return Object.values(DRUM_NOTE).includes(n) ? n : DRUM_NOTE[KIT_KEYS[((n % 12) + 12) % 12]];
   const [lo, hi] = sampleSpan(inst); return fold(n, lo, hi);
 }
-const velGain = v => 0.08 + 0.55 * Math.pow(v, 1.5); // same range as the band's chair gains
+const velGain = v => 0.3 + 0.55 * Math.pow(Math.max(0, Math.min(1, v)), 0.6); // gentle curve: soft playing stays audible
 function liveOn(note, vel, src) {
   if (!ctx || ctx.state !== "running" || !Object.keys(decoded).length) { setStatus("Tap to start audio first (or wait for samples), then play."); startAudio(); return; }
   const inst = live.inst, n = takeNote(inst, note), key = src + ":" + note, t = ctx.currentTime;
@@ -800,9 +819,14 @@ async function applySink() {
 
 function initLive() {
   $("liveInst").innerHTML = CHAIRS.map(c => `<option value="${c}">${INSTRUMENTS[c].label}${INSTRUMENTS[c].loop ? " (hold)" : ""}</option>`).join("");
-  $("liveInst").value = live.inst; $("liveLevel").value = live.level; $("liveRec").checked = live.rec; $("midiTransport").checked = live.midiTransport;
+  $("liveInst").value = live.inst; $("liveRec").checked = live.rec; $("midiTransport").checked = live.midiTransport;
   $("liveInst").onchange = e => { liveAllOff(); live.inst = e.target.value; saveLive(); renderKeys(); };
-  $("liveLevel").oninput = e => { live.level = +e.target.value; if (liveBus) liveBus.gain.value = live.level; saveLive(); };
+  for (const [id, k] of [["volLive", "liveDb"], ["volBand", "bandDb"], ["volMaster", "masterDb"]]) {
+    const el = $(id), out = $(id + "Db"), show = () => { out.textContent = live[k] <= -40 ? "−∞ dB" : (live[k] > 0 ? "+" : live[k] < 0 ? "−" : "") + Math.abs(live[k]).toFixed(1) + " dB"; };
+    el.value = live[k]; show();
+    el.oninput = () => { live[k] = +el.value; show(); applyLevels(); saveLive(); };
+    el.ondblclick = () => { live[k] = 0; el.value = 0; show(); applyLevels(); saveLive(); };
+  }
   $("liveRec").onchange = e => { live.rec = e.target.checked; if (!live.rec) closeAllRec(); saveLive(); };
   $("midiTransport").onchange = e => { live.midiTransport = e.target.checked; saveLive(); };
   $("midiIn").onchange = e => { live.midiIn = e.target.value; saveLive(); refreshMidi(); };
@@ -819,17 +843,17 @@ function initLive() {
   const box = $("miniKeys"), down = new Map();
   box.addEventListener("pointerdown", e => { const k = e.target.closest(".mk"); if (!k) return; e.preventDefault();
     try { k.releasePointerCapture(e.pointerId); } catch {} const n = +k.dataset.n; down.set(e.pointerId, n);
-    liveOn(n, e.pressure && e.pointerType === "pen" ? e.pressure : 0.8, "tap"); });
+    liveOn(n, e.pressure && e.pointerType === "pen" ? Math.max(KEY_VEL, e.pressure) : KEY_VEL, "tap"); });
   const up = e => { if (!down.has(e.pointerId)) return; liveOff(down.get(e.pointerId), "tap"); down.delete(e.pointerId); };
   ["pointerup", "pointercancel", "pointerleave"].forEach(t => box.addEventListener(t, up));
   box.addEventListener("pointerover", e => { if (!down.has(e.pointerId) || e.buttons === 0) return; const k = e.target.closest(".mk"); if (!k) return; const n = +k.dataset.n;
-    if (n !== down.get(e.pointerId)) { liveOff(down.get(e.pointerId), "tap"); down.set(e.pointerId, n); liveOn(n, 0.8, "tap"); } });
+    if (n !== down.get(e.pointerId)) { liveOff(down.get(e.pointerId), "tap"); down.set(e.pointerId, n); liveOn(n, KEY_VEL, "tap"); } });
   box.addEventListener("contextmenu", e => e.preventDefault());
   document.addEventListener("keydown", e => { if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return; if (/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && e.target.type !== "checkbox" && e.target.type !== "range") return;
     const k = e.key.toLowerCase(), i = KEYMAP.indexOf(k);
     if (k === "z" || k === "x") { live.oct = Math.max(1, Math.min(6, live.oct + (k === "z" ? -1 : 1))); saveLive(); renderKeys(); return; }
     if (k === " " && e.target === document.body) { e.preventDefault(); setSustain(true); return; }
-    if (i >= 0) { e.preventDefault(); liveOn(kbBase() + i, 0.8, "kb"); } });
+    if (i >= 0) { e.preventDefault(); liveOn(kbBase() + i, KEY_VEL, "kb"); } });
   document.addEventListener("keyup", e => { const k = e.key.toLowerCase(), i = KEYMAP.indexOf(k); if (k === " ") { setSustain(false); return; } if (i >= 0) liveOff(kbBase() + i, "kb"); });
   window.addEventListener("blur", () => { for (const [k] of [...liveVoices]) if (/^(kb|tap):/.test(k)) liveOff(+k.split(":")[1], k.split(":")[0]); });
   if (navigator.mediaDevices) { listOutputs(); navigator.mediaDevices.addEventListener && navigator.mediaDevices.addEventListener("devicechange", listOutputs); }
@@ -837,7 +861,7 @@ function initLive() {
   if (navigator.permissions && navigator.requestMIDIAccess) navigator.permissions.query({ name: "midi" }).then(p => { if (p.state === "granted") connectMidi(); }).catch(() => {});
   if (!navigator.requestMIDIAccess) $("midiNote").textContent = "Web MIDI isn't supported here (try Chrome/Edge). On-screen and computer keys still play.";
   renderKeys(); renderTakes();
-  window.__live = { liveOn, liveOff, setSustain, takes, onMidi, voices: liveVoices, live, tpos: () => ctx && transportPos(ctx.currentTime), get sustain() { return sustain; }, closeAllRec };
+  window.__live = { applyLevels, get levels() { return { liveBus: liveBus && liveBus.gain.value, band: bandBus && bandBus.gain.value, master: userMaster && userMaster.gain.value }; }, liveOn, liveOff, setSustain, takes, onMidi, voices: liveVoices, live, tpos: () => ctx && transportPos(ctx.currentTime), get sustain() { return sustain; }, closeAllRec };
 }
 
 restore();

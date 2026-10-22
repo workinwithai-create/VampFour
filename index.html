@@ -36,13 +36,19 @@
   <div class="row" id="recipes"></div>
   <h2 class="eyebrow">Chairs</h2>
   <div class="mutes" id="mutes"></div>
+  <h2 class="eyebrow">Volume</h2>
+  <section class="vols">
+    <div class="vol"><label for="volBand">Band</label><input id="volBand" type="range" min="-40" max="6" step="0.5" aria-label="Band volume (dB)" /><output id="volBandDb"></output></div>
+    <div class="vol"><label for="volMaster">Master</label><input id="volMaster" type="range" min="-40" max="6" step="0.5" aria-label="Master volume (dB)" /><output id="volMasterDb"></output></div>
+    <p class="small">Double-click a slider to reset to 0 dB. A limiter on the output keeps it from clipping. Saved on this device.</p>
+  </section>
   <h2 class="eyebrow">Play along live</h2>
   <section class="live" id="livePanel">
     <div class="controls">
       <label>Instrument <select id="liveInst"></select></label>
-      <label>Live level <input id="liveLevel" type="range" min="0" max="1.5" step="0.01" /></label>
       <span class="lamp" id="susLamp" title="Sustain (CC64 or hold Space)">Sustain</span>
     </div>
+    <div class="vol vol-live"><label for="volLive">Your playing</label><input id="volLive" type="range" min="-40" max="12" step="0.5" aria-label="Your playing volume (dB)" /><output id="volLiveDb"></output></div>
     <div class="kbrow"><button class="mini" id="octDn" aria-label="Octave down">◀</button><div id="miniKeys" class="minikeys"></div><button class="mini" id="octUp" aria-label="Octave up">▶</button><small id="octLbl"></small></div>
     <p class="small">Tap or click the keys, or use your computer keys A W S E D F T G Y H U J K (Z/X = octave, hold Space = sustain). Playing never starts the band.</p>
     <div class="controls">
