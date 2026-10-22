@@ -1,516 +1,610 @@
-// VampFour — four-bar vamp desk
-// Pinned samples only. Audio clock scheduling. Exports on the grid.
+// VampFour — four-bar vamp desk.
+// Rules: audio-clock lookahead scheduler, live state, OfflineAudioContext exports on the grid,
+// samples pinned to a commit SHA, pitch shift never more than ±4 semitones.
 
 const CDN = "https://cdn.jsdelivr.net/gh/workinwithai-create/PreEight@d58301e4a494555f411a2afbc448b724136eee76/public/samples";
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12;
 const SAMPLE_RATE = 48000;
+const STEPS_PER_BAR = 16;
+const CHORUS_BARS = 8, VAMP_BARS = 4, TOTAL_BARS = 12;
+const MAX_SHIFT = 4;
 
+// ---------- Instruments (each voice is the sample it is named after) ----------
+const NOTE = { C: 0, "C#": 1, Db: 1, D: 2, "D#": 3, Eb: 3, E: 4, F: 5, "F#": 6, Gb: 6, G: 7, "G#": 8, Ab: 8, A: 9, "A#": 10, Bb: 10, B: 11 };
+const nameToMidi = n => { const m = n.match(/^([A-G][b#]?)(\d)$/); return NOTE[m[1]] + 12 * (+m[2] + 1); };
+const INSTRUMENTS = {
+  piano:   { label: "Piano (FluidR3 acoustic grand)", dir: "piano", lo: 48, hi: 79,
+             notes: "C2 E2 G2 A2 Bb2 C3 Db3 E3 Gb3 G3 Ab3 A3 Bb3 C4 Db4 E4 Gb4 G4 A4 Bb4 C5 E5 G5 C6" },
+  bass:    { label: "Upright bass", dir: "bass", lo: 28, hi: 52,
+             notes: "E1 G1 A1 Bb1 C2 E2 G2 A2 Bb2 C3 E3 G3 A3" },
+  nylon:   { label: "Nylon guitar (FluidR3 nylon)", dir: "guitar", lo: 45, hi: 71,
+             notes: "A2 B2 D3 E3 G3 A3 B3 D4 E4 G4 A4 B4" },
+  trumpet: { label: "Trumpet", dir: "trumpet", lo: 60, hi: 79,
+             notes: "G3 A3 C4 E4 G4 A4 C5 E5 G5" },
+  violin:  { label: "Violin", dir: "violin", lo: 57, hi: 79, loop: true,
+             notes: "G3 A3 C4 E4 G4 A4 C5 E5 G5" },
+  kit:     { label: "Acoustic kit", dir: "drums", drums: ["kick", "snare", "hihat", "crash"] }
+};
+const CHAIRS = ["piano", "bass", "nylon", "trumpet", "violin", "kit"];
+const DRUM_NOTE = { kick: 36, snare: 38, hihat: 42, crash: 49 };
+
+function sampleList() {
+  const out = [];
+  for (const [inst, d] of Object.entries(INSTRUMENTS)) {
+    if (d.drums) d.drums.forEach(n => out.push({ inst, id: `${inst}:${n}`, url: `${CDN}/${d.dir}/${n}.mp3`, midi: DRUM_NOTE[n] }));
+    else d.notes.split(" ").forEach(n => out.push({ inst, id: `${inst}:${n}`, url: `${CDN}/${d.dir}/${n}.mp3`, midi: nameToMidi(n) }));
+  }
+  return out;
+}
+const SAMPLES = sampleList();
+
+// ---------- Chords ----------
+const QUAL = { "": [0, 4, 7], m: [0, 3, 7], "7": [0, 4, 7, 10], m7: [0, 3, 7, 10], maj7: [0, 4, 7, 11], dim: [0, 3, 6], sus4: [0, 5, 7], sus2: [0, 2, 7], "6": [0, 4, 7, 9], m6: [0, 3, 7, 9] };
+const KEYS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+function parseChord(sym) {
+  const m = String(sym).trim().match(/^([A-G])([b#]?)(maj7|m7|m6|m|7|dim|sus4|sus2|6)?$/);
+  if (!m) return null;
+  return { root: NOTE[m[1] + m[2]], q: m[3] || "", minor: /^m(?!aj)/.test(m[3] || "") || m[3] === "dim" };
+}
+function parseChords(text) {
+  const parts = String(text).trim().split(/[\s,|]+/).filter(Boolean);
+  if (parts.length !== 4) return null;
+  const c = parts.map(parseChord);
+  return c.every(Boolean) ? c : null;
+}
+const spell = pc => KEYS[((pc % 12) + 12) % 12];
+const chordName = c => spell(c.root) + c.q;
+const fold = (m, lo, hi) => { while (m < lo) m += 12; while (m > hi) m -= 12; return m; };
+
+const grooves = [
+  { id: "amber", name: "Amber Walk", bpm: 96, chords: "Am F C G" },
+  { id: "porch", name: "Porch Climb", bpm: 84, chords: "E B C#m A" },
+  { id: "fold", name: "Fold Radio", bpm: 108, chords: "Dm Bb F C" }
+];
 const recipes = [
-  { id: "pedal-hold", name: "Pedal hold", blurb: "Bass pedal. Kit half-time. Piano figure on the and." },
+  { id: "pedal-hold", name: "Pedal hold", blurb: "Bass pedal on the one. Kit half-time. Piano figure on the and." },
   { id: "nylon-vamp", name: "Nylon vamp", blurb: "Nylon figure loops. Hats die. Space for the vocal." },
   { id: "walk-under", name: "Walk under", blurb: "Upright walks the changes. Sparse piano." },
-  { id: "string-air", name: "String air", blurb: "Violin holds. Kit on 2 and 4. No crash." },
+  { id: "string-air", name: "String air", blurb: "Violin swells and holds each bar. Kit on 2 and 4. No crash." },
   { id: "half-pocket", name: "Half pocket", blurb: "Half-time kit. Root and fifth. Then the return." },
   { id: "call-figure", name: "Call figure", blurb: "Trumpet calls once per bar. Nylon answers." },
   { id: "stop-breath", name: "Stop breath", blurb: "Two hits. Two bars of air. The song returns." },
   { id: "bass-pedal", name: "Bass pedal", blurb: "Upright holds the tonic. Everything else thins." }
 ];
 
-function bar(symbol, piano, guitar, bass) { return { symbol, piano, guitar, bass }; }
-
-const grooves = [
-  { id: "amber", name: "Amber Walk", bpm: 96, key: "A minor",
-    chorus: [bar("Am",[45,48,52,57],[45,52,57],33),bar("F",[41,45,48,53],[41,48,53],41),bar("C",[48,52,55,60],[48,52,55],36),bar("G",[43,47,50,55],[43,47,50],31),bar("Am",[45,48,52,57],[45,52,57],33),bar("F",[41,45,48,53],[41,48,53],41),bar("C",[48,52,55,60],[48,52,55],36),bar("G",[43,47,50,55],[43,47,50],31)],
-    vamp: [bar("Am",[45,48,52,57],[45,52,57],33),bar("F",[41,45,48,53],[41,48,53],41),bar("C",[48,52,55,60],[48,52,55],36),bar("G",[43,47,50,55],[43,47,50],31)] },
-  { id: "porch", name: "Porch Climb", bpm: 84, key: "E major",
-    chorus: [bar("E",[40,44,47,52],[40,47,52],28),bar("B",[35,39,42,47],[35,42,47],23),bar("C#m",[44,47,51,56],[44,51,56],32),bar("A",[33,37,40,45],[33,40,45],33),bar("E",[40,44,47,52],[40,47,52],28),bar("B",[35,39,42,47],[35,42,47],23),bar("C#m",[44,47,51,56],[44,51,56],32),bar("A",[33,37,40,45],[33,40,45],33)],
-    vamp: [bar("A",[33,37,40,45],[33,40,45],33),bar("B",[35,39,42,47],[35,42,47],23),bar("E",[40,44,47,52],[40,47,52],28),bar("E",[40,44,47,52],[40,47,52],28)] },
-  { id: "fold", name: "Fold Radio", bpm: 108, key: "D minor",
-    chorus: [bar("Dm",[38,41,45,50],[38,45,50],26),bar("Bb",[34,38,41,46],[34,41,46],34),bar("F",[41,45,48,53],[41,48,53],29),bar("C",[36,40,43,48],[36,43,48],24),bar("Dm",[38,41,45,50],[38,45,50],26),bar("Bb",[34,38,41,46],[34,41,46],34),bar("F",[41,45,48,53],[41,48,53],29),bar("C",[36,40,43,48],[36,43,48],24)],
-    vamp: [bar("Bb",[34,38,41,46],[34,41,46],34),bar("C",[36,40,43,48],[36,43,48],24),bar("Dm",[38,41,45,50],[38,45,50],26),bar("Dm",[38,41,45,50],[38,45,50],26)] }
-];
-
+// ---------- State (one mutable object; scheduler reads it every step) ----------
 const state = {
-  groove: grooves[0],
-  recipe: recipes[0],
-  bpm: 96,
-  key: "A minor",
-  playing: false,
-  mode: null,
-  bar: 0,
-  mutes: {}
+  groove: "amber", recipe: "pedal-hold", bpm: 96, key: "A", chordText: "Am F C G",
+  mutes: { piano: false, bass: false, nylon: false, trumpet: false, violin: false, kit: false },
+  mode: "chorus", exportBars: 4, playing: false
 };
-
-let ctx, master, compressor, buffers = {}, rawBuffers = {}, activeSources = [];
-let nextStepTime = 0, step = 0, timerId = null, rafId = null;
-
-const CHORUS_BARS = 8;
-const VAMP_BARS = 4;
-const TOTAL_BARS = 12;
-const STEPS_PER_BAR = 16;
-
-function loadPersisted() {
-  try {
-    const s = JSON.parse(localStorage.getItem("vampfour") || "{}");
-    if (s.bpm) state.bpm = Math.max(60, Math.min(180, s.bpm));
-    if (s.key) state.key = s.key;
-    if (s.grooveId) state.groove = grooves.find(g => g.id === s.grooveId) || state.groove;
-    if (s.recipeId) state.recipe = recipes.find(r => r.id === s.recipeId) || state.recipe;
-  } catch {}
-  document.getElementById("bpm").value = state.bpm;
-  document.getElementById("key").value = state.key;
-}
+const LS = "vampfour.v2";
 function persist() {
-  localStorage.setItem("vampfour", JSON.stringify({
-    bpm: state.bpm, key: state.key, grooveId: state.groove.id, recipeId: state.recipe.id
-  }));
+  localStorage.setItem(LS, JSON.stringify({ groove: state.groove, recipe: state.recipe, bpm: state.bpm, key: state.key, chordText: state.chordText, mutes: state.mutes, exportBars: state.exportBars }));
+}
+function restore() {
+  try {
+    const s = JSON.parse(localStorage.getItem(LS) || "null");
+    if (!s) return;
+    if (s.bpm >= 60 && s.bpm <= 180) state.bpm = Math.round(s.bpm);
+    if (KEYS.includes(s.key)) state.key = s.key;
+    if (parseChords(s.chordText)) state.chordText = s.chordText;
+    if (recipes.some(r => r.id === s.recipe)) state.recipe = s.recipe;
+    if (s.groove) state.groove = s.groove;
+    if (s.mutes) for (const c of CHAIRS) state.mutes[c] = !!s.mutes[c];
+    if ([4, 8, 12].includes(s.exportBars)) state.exportBars = s.exportBars;
+  } catch {}
 }
 
-async function loadSamples() {
-  const files = [
-    ["kick", "drums/kick.mp3"], ["snare", "drums/snare.mp3"], ["hat", "drums/hihat.mp3"], ["crash", "drums/crash.mp3"],
-    ["pC3", "piano/C3.mp3"], ["pC4", "piano/C4.mp3"], ["pA3", "piano/A3.mp3"],
-    ["bE1", "bass/E1.mp3"], ["bA1", "bass/A1.mp3"], ["bC2", "bass/C2.mp3"],
-    ["gE2", "guitar/E2.mp3"], ["gA2", "guitar/A2.mp3"], ["gE3", "guitar/E3.mp3"],
-    ["tC4", "trumpet/C4.mp3"], ["vA3", "violin/A3.mp3"]
-  ];
-  const status = document.getElementById("status");
-  let loaded = 0, missing = [];
-  for (const [k, path] of files) {
-    const url = `${CDN}/${path}`;
-    try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(r.status);
-      const ab = await r.arrayBuffer();
-      rawBuffers[k] = ab;
-      buffers[k] = await (ctx || new AudioContext()).decodeAudioData(ab.slice(0));
-      loaded++;
-    } catch (e) {
-      missing.push(k);
-      console.warn(k, e);
+// Chords as typed, transposed so the first chord's root lands on the selected key.
+function currentChords(st = state) {
+  const c = parseChords(st.chordText) || parseChords("Am F C G");
+  const shift = NOTE[st.key] - c[0].root;
+  return c.map(x => ({ ...x, root: ((x.root + shift) % 12 + 12) % 12 }));
+}
+const keyLabel = (st = state) => st.key + (currentChords(st)[0].minor ? "m" : "");
+
+// ---------- Arrangement: one pure function feeds live playback, WAV and MIDI ----------
+// Returns events for step s of bar b (0..11): { chair, midi, gain, beats, swell }
+function eventsFor(b, s, st = state) {
+  const ch = currentChords(st);
+  const vamp = b >= CHORUS_BARS;
+  const c = ch[b % 4];
+  const next = ch[(b + 1) % 4];
+  const tones = QUAL[c.q].map(i => c.root + i);
+  const ev = [];
+  const add = (chair, midi, gain, beats, swell = false) => ev.push({ chair, midi, gain, beats, swell });
+  const bassRoot = fold(36 + c.root, 31, 45);
+  const fifth = fold(bassRoot + 7, 31, 50);
+  const pianoVoicing = tones.map(t => fold(48 + t, 55, 67)).sort((a, b) => a - b);
+  const kit = (n, g, beats = 0.5) => add("kit", DRUM_NOTE[n], g, beats);
+
+  if (!vamp) {
+    // Chorus pocket: full band.
+    if (s === 0 && b === 0) kit("crash", 0.35, 2);
+    if (s === 0 || s === 10) kit("kick", 0.8);
+    if (s === 4 || s === 12) kit("snare", 0.55);
+    if (s % 2 === 0) kit("hihat", s % 4 === 0 ? 0.22 : 0.14, 0.25);
+    if (s === 0 || s === 8) pianoVoicing.forEach(m => add("piano", m, 0.22, 1.8));
+    if (s === 0) add("bass", bassRoot, 0.7, 1.9);
+    if (s === 8) add("bass", fifth, 0.6, 1.9);
+    if (s % 4 === 2) add("nylon", fold(48 + tones[(s >> 2) % tones.length], 52, 67), 0.2, 0.9);
+    return ev;
+  }
+  const vb = b - CHORUS_BARS; // 0..3
+  switch (st.recipe) {
+    case "pedal-hold": {
+      if (s === 0) add("bass", fold(36 + ch[0].root, 31, 45), 0.72, 3.9);
+      if (s === 0) kit("kick", 0.7);
+      if (s === 8) kit("snare", 0.5);
+      if (s % 4 === 0) kit("hihat", 0.16, 0.25);
+      if (s % 4 === 2) add("piano", fold(60 + tones[(s >> 2) % tones.length], 64, 76), 0.2, 0.45);
+      break;
     }
-    status.textContent = `Seating chairs ${loaded}/${files.length}` + (missing.length ? ` · missing: ${missing.join(", ")}` : "");
+    case "nylon-vamp": {
+      if (s % 2 === 0) add("nylon", fold(48 + tones[(s >> 1) % tones.length] + ((s >> 1) % 4 === 3 ? 12 : 0), 50, 71), 0.24, 0.9);
+      if (s === 0) { kit("kick", 0.45); add("bass", bassRoot, 0.6, 1.9); }
+      break;
+    }
+    case "walk-under": {
+      if (s % 4 === 0) {
+        const q = s >> 2;
+        const walk = [bassRoot, fold(bassRoot + (tones[1] - tones[0]), 31, 50), fifth, fold(36 + next.root, 31, 45) - 1];
+        add("bass", fold(walk[q], 30, 50), 0.66, 0.95);
+        kit("hihat", 0.12, 0.25);
+      }
+      if (s === 0) { kit("kick", 0.45); pianoVoicing.forEach(m => add("piano", m, 0.16, 1.8)); }
+      break;
+    }
+    case "string-air": {
+      if (s === 0) {
+        add("violin", fold(60 + tones[1], 62, 74), 0.32, 4, true);
+        add("bass", bassRoot, 0.6, 3.9);
+        kit("kick", 0.55);
+      }
+      if (s === 4 || s === 12) kit("snare", 0.45);
+      if (s % 4 === 0) kit("hihat", 0.12, 0.25);
+      break;
+    }
+    case "half-pocket": {
+      if (s === 0) { kit("kick", 0.75); add("bass", bassRoot, 0.7, 1.9); pianoVoicing.forEach(m => add("piano", m, 0.2, 1.9)); }
+      if (s === 8) { kit("snare", 0.55); add("bass", fifth, 0.6, 1.9); }
+      if (s % 4 === 0) kit("hihat", 0.12, 0.25);
+      break;
+    }
+    case "call-figure": {
+      if (s === 2) add("trumpet", fold(60 + tones[tones.length > 3 ? 3 : 2], 64, 77), 0.3, 1.4);
+      if (s === 10 || s === 12) add("nylon", fold(48 + tones[s === 10 ? 2 : 1], 55, 69), 0.24, 0.9);
+      if (s === 0) { add("bass", bassRoot, 0.62, 1.9); kit("kick", 0.5); }
+      if (s % 4 === 0) kit("hihat", 0.12, 0.25);
+      break;
+    }
+    case "stop-breath": {
+      if (vb < 2 && s === 0) {
+        kit("kick", 0.8); kit("crash", 0.3, 1);
+        add("bass", bassRoot, 0.7, 0.9);
+        pianoVoicing.forEach(m => add("piano", m, 0.24, 0.9));
+      }
+      if (vb === 3 && s >= 12 && s % 2 === 0) kit("hihat", 0.1, 0.25); // count back in
+      break;
+    }
+    case "bass-pedal": {
+      if (s === 0) { add("bass", fold(36 + ch[0].root, 31, 45), 0.72, 3.9); add("piano", fold(60 + tones[2 % tones.length], 64, 76), 0.15, 1.9); }
+      if (s % 4 === 0) kit("hihat", 0.1, 0.25);
+      break;
+    }
   }
-  if (missing.length) {
-    status.textContent = `Missing instruments: ${missing.join(", ")}. Reload after unblocking the sample host.`;
-  } else {
-    status.textContent = "Chairs seated · live FluidR3 + kit · tap to start audio";
-  }
-  return missing.length === 0;
+  return ev;
 }
 
-function ensureCtx() {
-  if (!ctx) {
-    ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
-    compressor = ctx.createDynamicsCompressor();
-    compressor.threshold.value = -12;
-    compressor.knee.value = 6;
-    compressor.ratio.value = 4;
-    compressor.attack.value = 0.003;
-    compressor.release.value = 0.25;
-    master = ctx.createGain();
-    master.gain.value = 0.7;
-    master.connect(compressor);
-    compressor.connect(ctx.destination);
+// ---------- Audio ----------
+let ctx = null, master = null, sectionGain = null, chairGain = {}, decoded = {}, raw = {}, missing = [], active = [];
+let nextStepTime = 0, step = 0, timerId = null, rafId = null, scheduled = [];
+let vampMakeup = 1;
+window.__schedLog = [];
+
+function nearestSample(inst, midi) {
+  const d = INSTRUMENTS[inst];
+  if (d.drums) return { id: `${inst}:${Object.keys(DRUM_NOTE).find(k => DRUM_NOTE[k] === midi)}`, shift: 0 };
+  let best = null;
+  for (const s of SAMPLES) if (s.inst === inst) {
+    const sh = midi - s.midi;
+    if (!best || Math.abs(sh) < Math.abs(best.shift)) best = { id: s.id, shift: sh };
   }
-  if (ctx.state === "suspended") ctx.resume();
+  return best;
 }
 
-function rateFromMidi(midi, base) { return Math.pow(2, (midi - base) / 12); }
+function makeBus(ac) {
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -6; comp.knee.value = 3; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.2;
+  const m = ac.createGain(); m.gain.value = 0.8;
+  const sec = ac.createGain();
+  const chairs = {};
+  for (const c of CHAIRS) { chairs[c] = ac.createGain(); chairs[c].connect(sec); }
+  sec.connect(m); m.connect(comp); comp.connect(ac.destination);
+  return { master: m, sec, chairs };
+}
 
-function playNote(name, when, midi, baseMidi, gain = 0.4, duration = 0.3) {
-  const b = buffers[name];
-  if (!b || !ctx) return;
-  const transposed = transposeMidi(midi);
-  const rate = Math.pow(2, (transposed - baseMidi) / 12);
-  if (Math.abs(12 * Math.log2(rate)) > 4) return; // ±4 semitone gate
-  const src = ctx.createBufferSource();
-  src.buffer = b;
-  src.playbackRate.value = rate;
-  const g = ctx.createGain();
+// Zero-crossing loop points in the sustained middle of a sample.
+function loopPoints(buf, on = 0) {
+  const d = buf.getChannelData(0), sr = buf.sampleRate;
+  const zc = t => { let i = Math.floor(t * sr); while (i < d.length - 1 && !(d[i] <= 0 && d[i + 1] > 0)) i++; return i / sr; };
+  return [zc(on + Math.min(1.0, buf.duration * 0.35)), zc(Math.min(2.4, buf.duration * 0.8))];
+}
+
+// MP3 decoders add lead-in silence; start each sample at its real onset so hits land on the grid.
+const onsetCache = new WeakMap();
+function onsetOf(buf) {
+  if (onsetCache.has(buf)) return onsetCache.get(buf);
+  const d = buf.getChannelData(0); let pk = 0;
+  for (let i = 0; i < Math.min(d.length, buf.sampleRate); i++) pk = Math.max(pk, Math.abs(d[i]));
+  let i = 0; while (i < d.length && Math.abs(d[i]) < pk * 0.02) i++;
+  const t = Math.max(0, i - 8) / buf.sampleRate;
+  onsetCache.set(buf, t); return t;
+}
+
+// Schedule one note on any context (live or offline). Returns the source.
+function voice(ac, bufs, dest, e, when, bpm) {
+  const ns = nearestSample(e.chair, e.midi);
+  const buf = ns && bufs[ns.id];
+  if (!buf) return null;
+  if (Math.abs(ns.shift) > MAX_SHIFT) return null; // never stretch past ±4 st
+  const dur = Math.max(0.05, e.beats * 60 / bpm);
+  const src = ac.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = Math.pow(2, ns.shift / 12);
+  if (INSTRUMENTS[e.chair].loop) { const [a, b] = loopPoints(buf, onsetOf(buf)); src.loop = true; src.loopStart = a; src.loopEnd = b; }
+  const g = ac.createGain();
+  const atk = e.swell ? Math.min(0.6, dur * 0.3) : 0.004;
+  const rel = Math.min(0.08, Math.max(0.012, dur * 0.1));
   g.gain.setValueAtTime(0, when);
-  g.gain.linearRampToValueAtTime(gain, when + 0.01);
-  g.gain.setValueAtTime(gain, when + Math.max(0.01, duration - 0.02));
-  g.gain.linearRampToValueAtTime(0, when + duration);
-  src.connect(g);
-  g.connect(master);
-  src.start(when);
-  src.stop(when + duration + 0.05);
-  activeSources.push(src);
+  g.gain.linearRampToValueAtTime(e.gain, when + atk);
+  g.gain.setValueAtTime(e.gain, when + Math.max(atk, dur - rel));
+  g.gain.linearRampToValueAtTime(0, when + dur);
+  src.connect(g); g.connect(dest);
+  src.start(when, onsetOf(buf));
+  src.stop(when + dur + 0.02);
+  return src;
 }
 
-function chordAt(barIndex) {
-  if (barIndex < CHORUS_BARS) return state.groove.chorus[barIndex];
-  return state.groove.vamp[barIndex - CHORUS_BARS];
+async function fetchSamples() {
+  const status = document.getElementById("loadStatus");
+  let done = 0; missing = [];
+  await Promise.all(SAMPLES.map(async s => {
+    try {
+      const r = await fetch(s.url);
+      if (!r.ok) throw new Error(r.status);
+      raw[s.id] = await r.arrayBuffer();
+    } catch { missing.push(s); }
+    done++;
+    status.textContent = `Loading samples ${done}/${SAMPLES.length}`;
+  }));
+  if (missing.length) {
+    const names = [...new Set(missing.map(s => INSTRUMENTS[s.inst].label))];
+    status.textContent = `Missing instruments: ${names.join(", ")} (${missing.length} files). Playback and export are off until they load — check your connection or unblock cdn.jsdelivr.net and reload.`;
+    status.classList.add("bad");
+    return false;
+  }
+  status.textContent = `All ${SAMPLES.length} samples loaded.`;
+  return true;
 }
 
-function scheduleStep(stepIndex, time) {
-  const barIndex = Math.floor(stepIndex / STEPS_PER_BAR);
-  const s = stepIndex % STEPS_PER_BAR;
-  const onVamp = barIndex >= CHORUS_BARS;
-  const ch = chordAt(barIndex);
-  const rec = state.recipe.id;
-  const bpm = state.bpm;
-  const stepDur = 60 / bpm / 4;
+async function decodeAll(ac) {
+  const out = {};
+  await Promise.all(Object.entries(raw).map(async ([id, ab]) => { out[id] = await ac.decodeAudioData(ab.slice(0)); }));
+  return out;
+}
 
-  // Drums
-  if (s % 2 === 0 && !(onVamp && rec === "stop-breath" && barIndex >= 10)) {
-    playNote("hat", time, 60, 60, onVamp && rec === "half-pocket" ? 0.04 : 0.07, 0.1);
+let samplesOk = null, decodePromise = null;
+async function startAudio() {
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    const bus = makeBus(ctx); master = bus.master; sectionGain = bus.sec; chairGain = bus.chairs;
+    applyMutes();
   }
-  if (s === 0 && !(onVamp && rec === "string-air")) {
-    playNote("kick", time, 36, 36, 0.65, 0.15);
-  }
-  if (s === 8 && !(onVamp && (rec === "half-pocket" || rec === "stop-breath"))) {
-    playNote("snare", time, 38, 38, 0.4, 0.12);
-  }
+  if (ctx.state !== "running") await ctx.resume();
+  document.getElementById("tapGate").hidden = ctx.state === "running";
+  if (samplesOk === null) samplesOk = await samplesPromise;
+  if (samplesOk && !decodePromise) decodePromise = decodeAll(ctx).then(d => { decoded = d; measureLoudness(); });
+  if (decodePromise) await decodePromise;
+  refreshButtons();
+}
 
-  // Melodic on beat 1
-  if (s === 0) {
-    playNote("pC4", time, ch.piano[2] || 60, 60, 0.25, onVamp ? 0.8 : 0.4);
-    playNote("pA3", time, ch.piano[1] || 57, 57, 0.18, 0.5);
-    playNote("bA1", time, ch.bass, 33, 0.45, onVamp && rec === "bass-pedal" ? 1.8 : 0.6);
-    playNote("gA2", time, ch.guitar[0] || 45, 45, onVamp && rec === "nylon-vamp" ? 0.3 : 0.18, 0.5);
+function applyMutes() {
+  for (const c of CHAIRS) if (chairGain[c]) chairGain[c].gain.value = state.mutes[c] ? 0 : 1;
+}
+
+function modeRange(mode) {
+  return mode === "vamp" ? [CHORUS_BARS * STEPS_PER_BAR, TOTAL_BARS * STEPS_PER_BAR]
+       : mode === "form" ? [0, TOTAL_BARS * STEPS_PER_BAR]
+       : [0, CHORUS_BARS * STEPS_PER_BAR];
+}
+
+function scheduleStep(st, time) {
+  const b = Math.floor(st / STEPS_PER_BAR), s = st % STEPS_PER_BAR;
+  // A/B loudness match: the thinner vamp gets makeup gain, applied on the clock.
+  sectionGain.gain.setValueAtTime(b >= CHORUS_BARS ? vampMakeup : 1, time);
+  const ev = eventsFor(b, s);
+  const notes = [];
+  for (const e of ev) {
+    if (state.mutes[e.chair]) continue;
+    const src = voice(ctx, decoded, chairGain[e.chair], e, time, state.bpm);
+    if (src) { active.push(src); src.onended = () => { const i = active.indexOf(src); if (i >= 0) active.splice(i, 1); }; notes.push(`${e.chair}:${e.midi}`); }
   }
-  // Extra for recipes
-  if (onVamp && rec === "call-figure" && (s === 4 || s === 12)) {
-    playNote("tC4", time, (ch.piano[3] || 69), 60, 0.3, 0.4);
-  }
-  if (onVamp && rec === "string-air" && s === 0) {
-    playNote("vA3", time, ch.piano[2] || 60, 57, 0.22, 1.6);
-  }
+  scheduled.push({ time, bar: b });
+  if (scheduled.length > 256) scheduled.splice(0, 128);
+  window.__schedLog.push({ time, step: st, bar: b, bpm: state.bpm, recipe: state.recipe, mode: state.mode, mutes: { ...state.mutes }, notes });
+  if (window.__schedLog.length > 4000) window.__schedLog.splice(0, 2000);
 }
 
 function scheduler() {
-  if (!state.playing || !ctx) return;
   while (nextStepTime < ctx.currentTime + SCHEDULE_AHEAD) {
+    const [lo, hi] = modeRange(state.mode);
+    if (step < lo || step >= hi) step = lo; // mode change lands on the next step
     scheduleStep(step, nextStepTime);
-    const stepDur = 60 / state.bpm / 4;
-    nextStepTime += stepDur;
-    step = (step + 1) % (TOTAL_BARS * STEPS_PER_BAR);
-    if (state.mode === "eight" && step >= CHORUS_BARS * STEPS_PER_BAR) {
-      // continue into vamp only when in eight mode start
-    }
-    if (state.mode === "loop" && step >= CHORUS_BARS * STEPS_PER_BAR) step = 0;
-    if (state.mode === "cut" && step >= TOTAL_BARS * STEPS_PER_BAR) { stop(); return; }
-    if (state.mode === "eight" && step >= TOTAL_BARS * STEPS_PER_BAR) { stop(); return; }
+    nextStepTime += 60 / state.bpm / 4;
+    step++;
+    if (step >= hi) step = lo;
   }
 }
 
-function startPlay(mode) {
-  ensureCtx();
-  stop();
-  state.playing = true;
+async function play(mode) {
+  await startAudio();
+  if (!samplesOk) return;
+  if (state.playing) { // switch section live, no restart: jump at the next bar line
+    if (state.mode !== mode) { state.mode = mode; step = modeRange(mode)[0]; }
+    paintTransport(); return;
+  }
   state.mode = mode;
-  step = mode === "eight" ? CHORUS_BARS * STEPS_PER_BAR : 0;
+  state.playing = true;
+  step = modeRange(mode)[0];
   nextStepTime = ctx.currentTime + 0.1;
   timerId = setInterval(scheduler, LOOKAHEAD_MS);
-  rafId = requestAnimationFrame(updatePlayhead);
-  document.getElementById("status").textContent = "Playing · live on the audio clock";
+  scheduler();
+  rafId = requestAnimationFrame(tick);
+  setStatus("Playing on the audio clock. Change anything; it lands on the next step.");
+  paintTransport();
 }
 
-function stop() {
+function stop(reason) {
   state.playing = false;
-  state.mode = null;
-  if (timerId) clearInterval(timerId);
-  timerId = null;
-  if (rafId) cancelAnimationFrame(rafId);
-  activeSources.forEach(s => { try { s.stop(); } catch {} });
-  activeSources = [];
-  paintBars();
+  if (timerId) clearInterval(timerId); timerId = null;
+  if (rafId) cancelAnimationFrame(rafId); rafId = null;
+  const now = ctx ? ctx.currentTime : 0;
+  for (const s of active) { try { s.stop(now); } catch {} }
+  active = []; scheduled = [];
+  setStatus(reason || "Stopped.");
+  paintTransport(); paintBars(-1);
 }
 
-function updatePlayhead() {
-  if (!state.playing || !ctx) return;
-  const elapsed = ctx.currentTime - (nextStepTime - (step * (60 / state.bpm / 4)));
-  const currentStep = Math.floor(elapsed / (60 / state.bpm / 4));
-  state.bar = Math.floor(currentStep / STEPS_PER_BAR) % TOTAL_BARS;
-  paintBars();
-  rafId = requestAnimationFrame(updatePlayhead);
+function tick() {
+  if (!state.playing) return;
+  const now = ctx.currentTime;
+  let bar = -1;
+  for (const e of scheduled) if (e.time <= now) bar = e.bar;
+  paintBars(bar);
+  rafId = requestAnimationFrame(tick);
 }
 
-function punch() {
-  const g = state.groove, r = state.recipe;
-  return `VampFour punch list\n${g.name} · ${state.bpm} BPM · ${state.key} · ${r.name}\n\nThe problem: generators loop the chorus or mute to silence for a "vamp".\nSession players write four live bars of pedal, figure, and half kit so the song can breathe or hand off.\nThe move: ${r.blurb}\n\nChorus (bars 1-8)\n${g.chorus.map((b,i)=>`  ${i+1}. ${b.symbol}`).join("\n")}\n\nVamp (bars 9-12) — ${r.name}\n${g.vamp.map((b,i)=>`  ${i+9}. ${b.symbol}`).join("\n")}\n\nLive chairs only. Distinct from TagFour, LiftTwo, PreEight, AfterHook, EndEight, LastHook, ModEight.\nDrop the WAV on bars 9-12. Do not fade. The next section returns on 13.`;
+// ---------- Offline render (export + loudness) ----------
+// The limiter (DynamicsCompressorNode) has a fixed lookahead delay. Measure it once with an
+// impulse and read the render from that offset, so the first downbeat lands at sample 0.
+let busLatency = null;
+async function measureBusLatency() {
+  if (busLatency !== null) return busLatency;
+  const off = new OfflineAudioContext(2, SAMPLE_RATE / 4, SAMPLE_RATE);
+  const bus = makeBus(off);
+  const b = off.createBuffer(1, 64, SAMPLE_RATE); b.getChannelData(0).fill(0.25);
+  const src = off.createBufferSource(); src.buffer = b; src.connect(bus.chairs.kit); src.start(0);
+  const d = (await off.startRendering()).getChannelData(0);
+  let i = 0; while (i < d.length && Math.abs(d[i]) < 1e-6) i++;
+  busLatency = i < d.length ? i : 0;
+  return busLatency;
 }
 
-function paintGrooves() {
-  const el = document.getElementById("grooves"); el.innerHTML = "";
-  grooves.forEach(g => {
-    const b = document.createElement("button");
-    b.className = "card" + (state.groove.id === g.id ? " on" : "");
-    b.innerHTML = `<b>${g.name}</b><span>${g.bpm} BPM · ${g.key}</span>`;
-    b.onclick = () => { state.groove = g; state.bpm = g.bpm; document.getElementById("bpm").value = g.bpm; persist(); render(); };
-    el.appendChild(b);
-  });
-}
-function paintRecipes() {
-  const el = document.getElementById("recipes"); el.innerHTML = "";
-  recipes.forEach(r => {
-    const b = document.createElement("button");
-    b.className = "card" + (state.recipe.id === r.id ? " on" : "");
-    b.innerHTML = `<b>${r.name}</b><span>${r.blurb}</span>`;
-    b.onclick = () => { state.recipe = r; persist(); render(); };
-    el.appendChild(b);
-  });
-}
-function paintBars() {
-  const el = document.getElementById("bars"); el.innerHTML = "";
-  for (let i = 0; i < TOTAL_BARS; i++) {
-    const ch = chordAt(i);
-    const d = document.createElement("div");
-    d.className = "bar" + (i >= 8 ? " vamp" : "") + (state.playing && state.bar === i ? " active" : "");
-    d.innerHTML = `<div class="n">${i+1} · ${i >= 8 ? "V" : "C"}</div><div class="c">${ch.symbol}</div>`;
-    el.appendChild(d);
-  }
-}
-function render() { paintGrooves(); paintRecipes(); paintBars(); document.getElementById("punch").textContent = punch(); }
-
-// Export production path — OfflineAudioContext WAV + MIDI on the grid
-
-const KEY_OFFSETS = {
-  "A minor": 0, "C major": 3, "E minor": 7, "G major": 10, "D minor": 5
-};
-
-function keyOffset() {
-  return KEY_OFFSETS[state.key] || 0;
-}
-
-function transposeMidi(midi) {
-  return midi + keyOffset();
-}
-
-async function exportWav() {
-  if (!Object.keys(rawBuffers).length) {
-    alert("Samples not loaded. Tap the page first.");
-    return;
-  }
-  const statusEl = document.getElementById("status");
-  statusEl.textContent = "Rendering WAV…";
-  const bars = 4; // vamp only
-  const bpm = state.bpm;
-  const sampleRate = SAMPLE_RATE;
-  const exactLength = Math.round(bars * 4 * 60 / bpm * sampleRate);
-  const tailSeconds = 1.5;
-  const renderLength = exactLength + Math.round(tailSeconds * sampleRate);
-
-  const offline = new OfflineAudioContext(2, renderLength, sampleRate);
-  // Decode raw into offline
-  const offBuffers = {};
-  for (const [k, ab] of Object.entries(rawBuffers)) {
-    offBuffers[k] = await offline.decodeAudioData(ab.slice(0));
-  }
-
-  const offMaster = offline.createGain();
-  const offComp = offline.createDynamicsCompressor();
-  offComp.threshold.value = -12;
-  offComp.knee.value = 6;
-  offComp.ratio.value = 4;
-  offComp.attack.value = 0.003;
-  offComp.release.value = 0.25;
-  offMaster.connect(offComp);
-  offComp.connect(offline.destination);
-  offMaster.gain.value = 0.7;
-
-  function playOff(name, when, midi, baseMidi, gain = 0.4, duration = 0.3) {
-    const b = offBuffers[name];
-    if (!b) return;
-    const src = offline.createBufferSource();
-    src.buffer = b;
-    const rate = Math.pow(2, (transposeMidi(midi) - baseMidi) / 12);
-    if (Math.abs(12 * Math.log2(rate)) > 4) return; // respect ±4 semitone
-    src.playbackRate.value = rate;
-    const g = offline.createGain();
-    g.gain.setValueAtTime(0, when);
-    g.gain.linearRampToValueAtTime(gain, when + 0.01);
-    g.gain.setValueAtTime(gain, when + Math.max(0.01, duration - 0.02));
-    g.gain.linearRampToValueAtTime(0, when + duration);
-    src.connect(g);
-    g.connect(offMaster);
-    src.start(when);
-    src.stop(when + duration + 0.05);
-  }
-
+async function renderSection(st, bars, startBar, { fold: doFold = true, normalize = true } = {}) {
+  const bpm = st.bpm;
+  const exact = Math.round(bars * 4 * 60 / bpm * SAMPLE_RATE);
+  const tail = Math.round(2.5 * SAMPLE_RATE);
+  const lat = await measureBusLatency();
+  const off = new OfflineAudioContext(2, exact + tail + lat, SAMPLE_RATE);
+  const bufs = await decodeAll(off); // reuse the raw ArrayBuffers; never re-download
+  const bus = makeBus(off);
+  for (const c of CHAIRS) bus.chairs[c].gain.value = st.mutes[c] ? 0 : 1;
   const stepDur = 60 / bpm / 4;
-  let t = 0;
-  const startBar = CHORUS_BARS;
-  for (let s = 0; s < bars * STEPS_PER_BAR; s++) {
-    const barIndex = startBar + Math.floor(s / STEPS_PER_BAR);
-    const stepIn = s % STEPS_PER_BAR;
-    // Reuse schedule logic for vamp only
-    const ch = chordAt(barIndex);
-    const rec = state.recipe.id;
-    // Simplified drum + melodic for export (matches live)
-    if (stepIn % 2 === 0 && !(rec === "stop-breath" && barIndex >= 10)) {
-      playOff("hat", t, 60, 60, rec === "half-pocket" ? 0.04 : 0.07, 0.1);
-    }
-    if (stepIn === 0 && rec !== "string-air") {
-      playOff("kick", t, 36, 36, 0.65, 0.15);
-    }
-    if (stepIn === 8 && !(rec === "half-pocket" || rec === "stop-breath")) {
-      playOff("snare", t, 38, 38, 0.4, 0.12);
-    }
-    if (stepIn === 0) {
-      playOff("pC4", t, ch.piano[2] || 60, 60, 0.25, 0.8);
-      playOff("pA3", t, ch.piano[1] || 57, 57, 0.18, 0.5);
-      playOff("bA1", t, ch.bass, 33, 0.45, rec === "bass-pedal" ? 1.8 : 0.6);
-      playOff("gA2", t, ch.guitar[0] || 45, 45, rec === "nylon-vamp" ? 0.3 : 0.18, 0.5);
-    }
-    if (rec === "call-figure" && (stepIn === 4 || stepIn === 12)) {
-      playOff("tC4", t, ch.piano[3] || 69, 60, 0.3, 0.4);
-    }
-    if (rec === "string-air" && stepIn === 0) {
-      playOff("vA3", t, ch.piano[2] || 60, 57, 0.22, 1.6);
-    }
-    t += stepDur;
+  for (let i = 0; i < bars * STEPS_PER_BAR; i++) {
+    const b = startBar + (Math.floor(i / STEPS_PER_BAR) % (startBar >= CHORUS_BARS ? VAMP_BARS : TOTAL_BARS));
+    const t = i * stepDur; // first downbeat at sample 0, no offset, no jitter
+    for (const e of eventsFor(b, i % STEPS_PER_BAR, st)) if (!st.mutes[e.chair]) voice(off, bufs, bus.chairs[e.chair], e, t, bpm);
   }
-
-  const rendered = await offline.startRendering();
-  // Fold tail onto start
-  const chanData = [rendered.getChannelData(0), rendered.getChannelData(1)];
-  const folded = new AudioBuffer({ length: exactLength, numberOfChannels: 2, sampleRate });
-  for (let c = 0; c < 2; c++) {
-    const src = chanData[c];
-    const dst = folded.getChannelData(c);
-    for (let i = 0; i < exactLength; i++) {
-      let v = src[i] || 0;
-      if (i < renderLength - exactLength) v += src[exactLength + i] || 0;
-      dst[i] = v;
-    }
+  const r = await off.startRendering();
+  const L = new Float32Array(exact), R = new Float32Array(exact);
+  const l = r.getChannelData(0).subarray(lat), rr = r.getChannelData(1).subarray(lat);
+  L.set(l.subarray(0, exact)); R.set(rr.subarray(0, exact));
+  if (doFold) for (let i = 0; i < tail && i < exact; i++) { L[i] += l[exact + i]; R[i] += rr[exact + i]; }
+  if (normalize) {
+    let pk = 0;
+    for (let i = 0; i < exact; i++) pk = Math.max(pk, Math.abs(L[i]), Math.abs(R[i]));
+    const g = pk > 0 ? Math.pow(10, -1.1 / 20) / pk : 1; // peak lands at −1.1 dBFS (≤ −1 after 24-bit rounding)
+    for (let i = 0; i < exact; i++) { L[i] *= g; R[i] *= g; }
   }
-  // Peak normalize to -1 dBFS
-  let peak = 0;
-  for (let c = 0; c < 2; c++) {
-    const d = folded.getChannelData(c);
-    for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+  return { L, R, exact };
+}
+
+const rms = (L, R) => { let s = 0; for (let i = 0; i < L.length; i++) s += L[i] * L[i] + R[i] * R[i]; return Math.sqrt(s / (2 * L.length)); };
+let loudTimer = null;
+function measureLoudness() {
+  clearTimeout(loudTimer);
+  loudTimer = setTimeout(async () => {
+    if (!samplesOk) return;
+    const st = { ...state, mutes: { ...state.mutes }, bpm: 120 };
+    const a = await renderSection(st, 4, 0, { fold: false, normalize: false });
+    const b = await renderSection(st, 4, CHORUS_BARS, { fold: false, normalize: false });
+    const ra = rms(a.L, a.R), rb = rms(b.L, b.R);
+    vampMakeup = rb > 1e-5 ? Math.max(0.5, Math.min(4, ra / rb)) : 1;
+    window.__vampMakeup = { chorusRms: ra, vampRms: rb, makeup: vampMakeup };
+  }, 250);
+}
+
+function wav24(L, R) {
+  const n = L.length, ba = 6, data = n * ba, buf = new ArrayBuffer(44 + data), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + data, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, SAMPLE_RATE, true);
+  v.setUint32(28, SAMPLE_RATE * ba, true); v.setUint16(32, ba, true); v.setUint16(34, 24, true); w(36, "data"); v.setUint32(40, data, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) for (const ch of [L, R]) {
+    let x = Math.round(Math.max(-1, Math.min(1, ch[i])) * 8388607);
+    v.setUint8(o, x & 255); v.setUint8(o + 1, (x >> 8) & 255); v.setUint8(o + 2, (x >> 16) & 255); o += 3;
   }
-  const target = Math.pow(10, -1 / 20); // -1 dBFS
-  const gain = peak > 0 ? Math.min(1, target / peak) : 1;
-  for (let c = 0; c < 2; c++) {
-    const d = folded.getChannelData(c);
-    for (let i = 0; i < d.length; i++) d[i] *= gain;
-  }
-
-  // Encode as 16-bit WAV (24-bit requires more; documented as production 16-bit for now, peak correct)
-  const wav = audioBufferToWav(folded);
-  const name = `vampfour-${state.recipe.id}-${bpm}bpm-${state.key.replace(/\s/g,"")}.wav`;
-  downloadBlob(new Blob([wav], { type: "audio/wav" }), name);
-  statusEl.textContent = `Exported ${name} · ${exactLength} samples · peak ≤ -1 dBFS · first downbeat at 0 · tail folded`;
+  return new Uint8Array(buf);
 }
 
-function audioBufferToWav(buffer) {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const format = 1; // PCM
-  const bitDepth = 16;
-  const bytesPerSample = bitDepth / 8;
-  const blockAlign = numChannels * bytesPerSample;
-  const dataLength = buffer.length * blockAlign;
-  const bufferLength = 44 + dataLength;
-  const arrayBuffer = new ArrayBuffer(bufferLength);
-  const view = new DataView(arrayBuffer);
-  writeString(view, 0, "RIFF");
-  view.setUint32(4, 36 + dataLength, true);
-  writeString(view, 8, "WAVE");
-  writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, format, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitDepth, true);
-  writeString(view, 36, "data");
-  view.setUint32(40, dataLength, true);
-  let offset = 44;
-  for (let i = 0; i < buffer.length; i++) {
-    for (let c = 0; c < numChannels; c++) {
-      const sample = Math.max(-1, Math.min(1, buffer.getChannelData(c)[i]));
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
-      offset += 2;
-    }
-  }
-  return arrayBuffer;
-}
-function writeString(view, offset, str) {
-  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+function fileBase(st, ext) { return `vampfour-${st.recipe}-${st.bpm}bpm-${keyLabel(st)}.${ext}`; }
+function exportState(o = {}) {
+  const st = { ...state, mutes: { ...state.mutes }, ...o };
+  if (o.mutes) st.mutes = { ...state.mutes, ...o.mutes };
+  return st;
 }
 
-function downloadBlob(blob, name) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
+async function exportWavBytes(o = {}) {
+  const st = exportState(o);
+  const bars = o.bars || state.exportBars;
+  const startBar = bars === 12 ? 0 : CHORUS_BARS; // 4/8 bars = the vamp (looped); 12 = full form
+  const { L, R, exact } = await renderSection(st, bars, startBar);
+  return { name: fileBase(st, "wav"), bytes: wav24(L, R), frames: exact };
 }
 
-function exportMid() {
-  // Minimal MIDI Type 1 with tempo track + one track per chair (simplified piano/bass/kit)
-  const bpm = state.bpm;
-  const ticksPerBeat = 480;
-  const bars = 4;
-  // Header + tracks placeholder; full multi-track in next pass
-  const name = `vampfour-${state.recipe.id}-${bpm}bpm-${state.key.replace(/\s/g,"")}.mid`;
-  // For now generate a basic tempo-set MIDI; production expands to per-chair
-  const midi = buildSimpleMidi(bpm, bars, state.key);
-  downloadBlob(new Blob([midi], { type: "audio/midi" }), name);
-  document.getElementById("status").textContent = `Exported ${name} · tempo ${bpm} · 4/4 · downbeat at 0`;
-}
-
-function buildSimpleMidi(bpm, bars, key) {
-  // Very minimal SMF: header + tempo track + one note track
-  const tpq = 480;
-  const usPerBeat = Math.round(60000000 / bpm);
-  const events = [];
-  // Tempo meta
-  events.push({ delta: 0, data: [0xFF, 0x51, 0x03, (usPerBeat >> 16) & 0xFF, (usPerBeat >> 8) & 0xFF, usPerBeat & 0xFF] });
-  // Time sig 4/4
-  events.push({ delta: 0, data: [0xFF, 0x58, 0x04, 4, 2, 24, 8] });
-  // End
-  const endDelta = bars * 4 * tpq;
-  events.push({ delta: endDelta, data: [0xFF, 0x2F, 0x00] });
-  return encodeMidi(events, tpq);
-}
-function encodeMidi(events, tpq) {
-  // Simplified encoder for one track
-  const trackData = [];
+// ---------- MIDI (format 1, tempo + 4/4, one track per chair) ----------
+const vlq = n => { const b = [n & 127]; while ((n >>= 7)) b.unshift((n & 127) | 128); return b; };
+const str = s => [...s].map(c => c.charCodeAt(0));
+function track(evts, name) {
+  evts.sort((a, b) => a.t - b.t || a.order - b.order);
+  const d = [0, 0xff, 0x03, ...vlq(name.length), ...str(name)];
   let last = 0;
-  for (const ev of events) {
-    const delta = ev.delta - last;
-    last = ev.delta;
-    trackData.push(...vlq(delta), ...ev.data);
-  }
-  const trackLen = trackData.length;
-  const header = [
-    0x4D, 0x54, 0x68, 0x64, 0x00, 0x00, 0x00, 0x06,
-    0x00, 0x00, 0x00, 0x01, (tpq >> 8) & 0xFF, tpq & 0xFF
-  ];
-  const trackHeader = [0x4D, 0x54, 0x72, 0x6B, (trackLen >> 24) & 0xFF, (trackLen >> 16) & 0xFF, (trackLen >> 8) & 0xFF, trackLen & 0xFF];
-  return new Uint8Array([...header, ...trackHeader, ...trackData]);
+  for (const e of evts) { d.push(...vlq(e.t - last), ...e.data); last = e.t; }
+  d.push(0, 0xff, 0x2f, 0);
+  return [...str("MTrk"), (d.length >>> 24) & 255, (d.length >>> 16) & 255, (d.length >>> 8) & 255, d.length & 255, ...d];
 }
-function vlq(n) {
-  const bytes = [];
-  bytes.push(n & 0x7F);
-  n >>= 7;
-  while (n) {
-    bytes.push((n & 0x7F) | 0x80);
-    n >>= 7;
+function exportMidBytes(o = {}) {
+  const st = exportState(o);
+  const bars = o.bars || state.exportBars, startBar = bars === 12 ? 0 : CHORUS_BARS;
+  const TPQ = 480, tps = TPQ / 4, total = bars * 4 * TPQ;
+  const us = Math.round(60000000 / st.bpm);
+  const tempo = [{ t: 0, order: 0, data: [0xff, 0x51, 3, (us >> 16) & 255, (us >> 8) & 255, us & 255] },
+                 { t: 0, order: 0, data: [0xff, 0x58, 4, 4, 2, 24, 8] },
+                 { t: total, order: 0, data: [0xff, 0x01, 3, ...str("end")] }];
+  const per = {}; CHAIRS.forEach(c => per[c] = []);
+  const chan = { piano: 0, bass: 1, nylon: 2, trumpet: 3, violin: 4, kit: 9 };
+  for (let i = 0; i < bars * STEPS_PER_BAR; i++) {
+    const b = startBar + (Math.floor(i / STEPS_PER_BAR) % (startBar >= CHORUS_BARS ? VAMP_BARS : TOTAL_BARS));
+    for (const e of eventsFor(b, i % STEPS_PER_BAR, st)) {
+      if (st.mutes[e.chair]) continue;
+      const t = i * tps, len = Math.max(1, Math.min(Math.round(e.beats * TPQ), total - t));
+      const ch = chan[e.chair], vel = Math.max(1, Math.min(127, Math.round(e.gain * 150)));
+      per[e.chair].push({ t, order: 1, data: [0x90 | ch, e.midi, vel] }, { t: t + len, order: 0, data: [0x80 | ch, e.midi, 0] });
+    }
   }
-  return bytes.reverse();
+  const names = { piano: "Piano", bass: "Upright bass", nylon: "Nylon guitar", trumpet: "Trumpet", violin: "Violin", kit: "Kit" };
+  const used = CHAIRS.filter(c => per[c].length);
+  const tracks = [track(tempo, "VampFour tempo"), ...used.map(c => { per[c].push({ t: total, order: 2, data: [0xff, 0x01, 3, ...str("end")] }); return track(per[c], names[c]); })];
+  const hdr = [...str("MThd"), 0, 0, 0, 6, 0, 1, 0, tracks.length, (TPQ >> 8) & 255, TPQ & 255];
+  return { name: fileBase(st, "mid"), bytes: new Uint8Array([...hdr, ...tracks.flat()]) };
 }
 
-document.getElementById("bpm").onchange = (e) => { state.bpm = +e.target.value; persist(); };
-document.getElementById("key").onchange = (e) => { state.key = e.target.value; persist(); };
-document.getElementById("playA").onclick = () => startPlay("loop");
-document.getElementById("playB").onclick = () => startPlay("cut");
-document.getElementById("play8").onclick = () => startPlay("eight");
-document.getElementById("stop").onclick = stop;
-document.getElementById("copy").onclick = () => navigator.clipboard.writeText(punch());
-document.getElementById("exportWav").onclick = exportWav;
-document.getElementById("exportMid").onclick = exportMid;
+function download(bytes, name, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes], { type }));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+async function doExportWav() {
+  await startAudio(); if (!samplesOk) return;
+  setStatus("Rendering WAV…");
+  const r = await exportWavBytes();
+  download(r.bytes, r.name, "audio/wav");
+  setStatus(`Exported ${r.name} · ${r.frames.toLocaleString()} samples · 48 kHz 24-bit stereo · downbeat at sample 0 · tail folded.`);
+}
+async function doExportMid() {
+  const r = exportMidBytes();
+  download(r.bytes, r.name, "audio/midi");
+  setStatus(`Exported ${r.name} · one track per chair · tempo ${state.bpm} · 4/4.`);
+}
 
-document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
-window.addEventListener("click", () => { if (!ctx) { ensureCtx(); loadSamples(); } }, { once: true });
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+function setStatus(t) { $("status").textContent = t; }
+function refreshButtons() {
+  const ok = !!samplesOk && Object.keys(decoded).length > 0;
+  for (const id of ["playA", "playB", "playForm", "exportWav"]) $(id).disabled = samplesOk === false;
+  $("exportWav").title = ok ? "" : "Loads after the first tap";
+}
+function paintTransport() {
+  for (const [id, m] of [["playA", "chorus"], ["playB", "vamp"], ["playForm", "form"]]) $(id).classList.toggle("on", state.playing && state.mode === m);
+}
+function paintCards() {
+  const g = $("grooves"); g.innerHTML = "";
+  grooves.forEach(x => {
+    const b = document.createElement("button");
+    b.className = "card" + (state.chordText === x.chords && state.groove === x.id ? " on" : "");
+    b.innerHTML = `<b>${x.name}</b><span>${x.chords} · ${x.bpm} BPM</span>`;
+    b.onclick = () => { state.groove = x.id; state.chordText = x.chords; state.bpm = x.bpm; state.key = spell(parseChords(x.chords)[0].root); syncInputs(); changed(); };
+    g.appendChild(b);
+  });
+  const r = $("recipes"); r.innerHTML = "";
+  recipes.forEach(x => {
+    const b = document.createElement("button");
+    b.className = "card" + (state.recipe === x.id ? " on" : "");
+    b.dataset.recipe = x.id;
+    b.innerHTML = `<b>${x.name}</b><span>${x.blurb}</span>`;
+    b.onclick = () => { state.recipe = x.id; changed(); };
+    r.appendChild(b);
+  });
+}
+function paintBars(active = -1) {
+  const el = $("bars"), ch = currentChords();
+  if (el.children.length !== TOTAL_BARS) { el.innerHTML = ""; for (let i = 0; i < TOTAL_BARS; i++) el.appendChild(document.createElement("div")); }
+  [...el.children].forEach((d, i) => {
+    d.className = "bar" + (i >= CHORUS_BARS ? " vamp" : "") + (i === active ? " active" : "");
+    d.innerHTML = `<div class="n">${i + 1} · ${i >= CHORUS_BARS ? "Vamp" : "Chorus"}</div><div class="c">${chordName(ch[i % 4])}</div>`;
+  });
+}
+function punch() {
+  const r = recipes.find(x => x.id === state.recipe), ch = currentChords().map(chordName);
+  return `VampFour punch list\n${state.bpm} BPM · key ${keyLabel()} · chords ${ch.join(" ")} · ${r.name}\n\nThe move: ${r.blurb}\nChorus bars 1–8: ${ch.join(" ")} ×2\nVamp bars 9–12: ${ch.join(" ")} — ${r.name}\n\nDrop the WAV on bar 9 of your session. Do not fade. The next section returns on 13.`;
+}
+function syncInputs() { $("bpm").value = state.bpm; $("key").value = state.key; $("chords").value = state.chordText; $("exportBars").value = state.exportBars; document.querySelectorAll("[data-mute]").forEach(e => e.checked = !state.mutes[e.dataset.mute]); }
+function changed() { persist(); applyMutes(); paintCards(); paintBars(); $("punch").textContent = punch(); measureLoudness(); }
 
-loadPersisted();
-render();
+function buildUI() {
+  $("key").innerHTML = KEYS.map(k => `<option>${k}</option>`).join("");
+  $("mutes").innerHTML = CHAIRS.map(c => `<label><input type="checkbox" data-mute="${c}" checked> ${c === "kit" ? "Kit" : c[0].toUpperCase() + c.slice(1)}</label>`).join("");
+  syncInputs();
+  $("bpm").addEventListener("change", e => { const v = Math.round(+e.target.value); if (v >= 60 && v <= 180) { state.bpm = v; changed(); } else e.target.value = state.bpm; });
+  $("key").addEventListener("change", e => { state.key = e.target.value; changed(); });
+  $("chords").addEventListener("change", e => {
+    if (parseChords(e.target.value)) { state.chordText = e.target.value.trim().split(/[\s,|]+/).join(" "); state.groove = "custom"; $("chordErr").textContent = ""; changed(); }
+    else $("chordErr").textContent = "Enter exactly 4 chords, like Am F C G (m, 7, m7, maj7, sus2, sus4, dim, 6).";
+  });
+  $("exportBars").addEventListener("change", e => { state.exportBars = +e.target.value; persist(); });
+  document.querySelectorAll("[data-mute]").forEach(e => e.addEventListener("input", () => { state.mutes[e.dataset.mute] = !e.checked; changed(); }));
+  $("tapBtn").onclick = () => startAudio();
+  $("playA").onclick = () => play("chorus");
+  $("playB").onclick = () => play("vamp");
+  $("playForm").onclick = () => play("form");
+  $("stop").onclick = () => stop();
+  $("copy").onclick = () => navigator.clipboard && navigator.clipboard.writeText(punch());
+  $("exportWav").onclick = doExportWav;
+  $("exportMid").onclick = doExportMid;
+  if (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) $("iosNote").hidden = false;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && state.playing) stop("Stopped because the tab was hidden. Press play to start again.");
+  });
+  changed();
+}
+
+restore();
+buildUI();
+const samplesPromise = fetchSamples().then(ok => { samplesOk = ok; refreshButtons(); return ok; });
+window.__vampfour = { get busLatency() { return busLatency; }, get ctx() { return ctx; }, get playing() { return state.playing; }, state, eventsFor, exportWavBytes, exportMidBytes, SAMPLES, nearestSample, INSTRUMENTS };

@@ -2,41 +2,63 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>VampFour — four-bar vamp desk</title>
-  <meta name="description" content="Four live-instrument bars of vamp so the song can breathe. Then the next section lands." />
+  <meta name="description" content="Four live-instrument bars of vamp so the song can breathe. Your BPM, your key, your chords. Exports WAV + MIDI on the grid." />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+<div id="tapGate" class="gate">
+  <div>
+    <p class="eyebrow">VampFour</p>
+    <button id="tapBtn" class="big">Tap to start audio</button>
+    <p class="small">Browsers need one tap before they make sound.</p>
+  </div>
+</div>
 <main>
-  <p class="eyebrow">WorkinWithAI · live chairs</p>
+  <p class="eyebrow">WorkinWithAI · live chairs · free</p>
   <h1>VampFour</h1>
   <p class="lead">Four-bar vamp desk. Generators loop the chorus or mute to silence. Session players write four live bars of pedal, figure, and half kit so the track can breathe or hand off. Live piano, upright, nylon, kit, trumpet, violin.</p>
-  <p class="status" id="status">Seating chairs…</p>
+  <p class="status" id="loadStatus">Loading samples…</p>
+  <p class="status" id="status">Set your loop, then tap play.</p>
+  <p class="status ios" id="iosNote" hidden>iPhone/iPad: the silent switch mutes web audio. Flip it off if you hear nothing.</p>
+  <h2 class="eyebrow">Your loop</h2>
   <div class="controls">
-    <label>BPM <input type="number" id="bpm" min="60" max="180" value="96" /></label>
-    <label>Key <select id="key"><option>A minor</option><option>C major</option><option>E minor</option><option>G major</option><option>D minor</option></select></label>
+    <label>BPM <input type="number" id="bpm" min="60" max="180" step="1" inputmode="numeric" /></label>
+    <label>Key <select id="key"></select></label>
+    <label class="grow">4 chords <input type="text" id="chords" spellcheck="false" autocapitalize="off" placeholder="Am F C G" /></label>
   </div>
-  <p class="eyebrow">Groove</p>
+  <p class="err" id="chordErr"></p>
+  <p class="small">Your chords are transposed so the first chord sits on the key. Saved on this device and used for playback and export.</p>
+  <h2 class="eyebrow">Demo grooves</h2>
   <div class="row" id="grooves"></div>
-  <p class="eyebrow">Vamp</p>
+  <h2 class="eyebrow">Vamp recipe</h2>
   <div class="row" id="recipes"></div>
-  <p class="eyebrow">Form · chorus 1–8 · vamp 9–12</p>
+  <h2 class="eyebrow">Chairs</h2>
+  <div class="mutes" id="mutes"></div>
+  <h2 class="eyebrow">Form · chorus 1–8 · vamp 9–12</h2>
   <div class="bars" id="bars"></div>
-  <h2>Punch list</h2>
-  <pre id="punch"></pre>
+  <h2 class="eyebrow">Export</h2>
   <div class="exports">
-    <button id="exportWav">Export WAV (bars 9–12)</button>
+    <select id="exportBars" aria-label="Export length">
+      <option value="4">Vamp · 4 bars</option>
+      <option value="8">Vamp ×2 · 8 bars</option>
+      <option value="12">Full form · 12 bars</option>
+    </select>
+    <button id="exportWav">Export WAV</button>
     <button id="exportMid">Export MIDI</button>
   </div>
+  <p class="small">48 kHz · 24-bit stereo · first downbeat at sample 0 · ring-out folded onto the start so it loops clean · one MIDI track per chair.</p>
+  <h2 class="eyebrow">Punch list</h2>
+  <pre id="punch"></pre>
 </main>
 <div class="dock">
-  <button id="playA">A · Loop</button>
+  <button id="playA">A · Chorus</button>
   <button id="playB">B · Vamp</button>
-  <button id="play8">8 · Vamp only</button>
+  <button id="playForm">Full form</button>
   <button class="ghost" id="stop">Stop</button>
   <button class="ghost" id="copy">Copy punch</button>
 </div>
-<script type="module" src="./app.js"></script>
+<script src="./app.js"></script>
 </body>
 </html>

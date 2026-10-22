@@ -31,43 +31,45 @@ VampFour is the middle-section breath — not an ending, not a climb, not a dens
 
 ## Play
 
-- A · Loop (chorus only, so you can hear the missing breath)
-- B · Full form (chorus + vamp, then stop)
-- 8 · Vamp only (for the export you drop on bars 9–12)
+- A · Chorus (bars 1–8 loop, so you can hear the missing breath)
+- B · Vamp (bars 9–12 loop — the part you export)
+- Full form (1–12 loop). Switch sections while playing; it lands on the next step.
 
-## Exports (production-ready)
+## Your loop first
+
+- BPM field (60–180), key selector (all 12 keys), and a 4-chord entry (e.g. `Am F C G`). Chords are transposed so the first chord sits on the key.
+- Presets are demos. Your settings persist in localStorage and drive playback and export.
+- Per-chair mutes. Changes land on the next step while playing, no restart.
+
+## Exports
 
 WAV and MIDI drop on the DAW grid:
-- OfflineAudioContext render
-- First downbeat at sample 0
-- Exact length `Math.round(bars * 4 * 60 / bpm * 48000)`
-- Ring-out tail folded for seamless loop
-- Peak ≤ -1 dBFS
-- Key transposition applied
-- Matching MIDI with tempo and 4/4
+- OfflineAudioContext render, 48 kHz / 24-bit stereo
+- First downbeat at sample 0 (limiter lookahead and MP3 lead-in are compensated)
+- Exact length `Math.round(bars * 4 * 60 / bpm * 48000)` — 92 BPM × 8 bars = 1,001,739 samples
+- Ring-out tail folded onto the start for a seamless loop; peak −1.1 dBFS
+- Deterministic (no randomness); reuses the samples already loaded
+- Lengths: vamp 4 bars, vamp ×2 (8 bars), full form (12 bars)
+- MIDI format 1: tempo + 4/4, one track per chair (piano, upright bass, nylon, trumpet, violin, kit on ch 10)
 
 File names: `vampfour-<recipe>-<bpm>bpm-<key>.wav` / `.mid`
 
-## Pricing recommendation
+## Samples
 
-**One-time $29** on Lemon Squeezy (merchant of record).  
-Mirror on Gumroad for the producer crowd.  
-Do not subscribe; this is a finite desk, not a cloud meter.  
-Forge Pass stays the $24 bundle for the recurring tools.
+PreEight bank pinned to commit `d58301e4a494555f411a2afbc448b724136eee76` (FluidR3 piano, upright, nylon, trumpet, violin; acoustic kit). 71 files preload with a visible count; if any fail the UI names the missing instruments and playback/export stay off. Multi-sampled so no note is pitch-shifted more than ±4 semitones (max used: 2). Violin holds use zero-crossing loop points with attack/release ramps.
 
-Best place to sell: Lemon Squeezy primary, Gumroad secondary, pinned X demo + r/WeAreTheMusicMakers / Product Hunt post.
+## Pricing
+
+Free. No price, no license key, no checkout. If it is sold later, wire a Lemon Squeezy license check first and change this line.
 
 ## License
 
-MIT.  
-Free to use. No license gate.  
-If a priced build is later required, add a Lemon Squeezy key check or WorkinWithAI entitlement before calling it paid.
+MIT.
 
 ## Audio engine
 
-Follows WorkinWithAI rules: AudioContext clock lookahead scheduler, live state, OfflineAudioContext exports on the grid (first downbeat at sample 0, exact length, tail folded), pinned samples, sustain envelopes, master compressor, visibility stop, localStorage persistence.
+Follows the WorkinWithAI audio rules: AudioContext-clock lookahead scheduler, one live state object, OfflineAudioContext exports on the grid, pinned samples, sustain envelopes, per-chair gain → master → DynamicsCompressor limiter, A/B loudness matched (vamp makeup gain measured offline), tap-to-start audio, stop on tab hide, iOS silent-switch note.
 
 ## Stack
 
-Static HTML / CSS / JS.  
-Deploy on Vercel team `release-forge`.
+Static HTML + one JS file. No build, no auth, no database.
